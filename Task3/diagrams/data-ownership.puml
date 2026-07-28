@@ -1,0 +1,56 @@
+@startuml
+title AdScale — владение данными (Database per Service)
+left to right direction
+skinparam componentStyle rectangle
+skinparam linetype ortho
+
+package "Bidding bounded context" {
+  component "Bidding Service" as bidding
+  database "Bidding PostgreSQL\nprimary + standby\nSoT bid policy/decisions/outbox" as bidding_db
+  database "Redis / L1\nпроизводный кэш" as redis
+  bidding --> bidding_db : owner read/write
+  bidding --> redis : hot-path read
+}
+
+package "Campaign bounded context" {
+  component "Campaign Service" as campaign
+  database "Campaign PostgreSQL\nprimary + standby\nSoT campaigns/creatives/targeting" as campaign_db
+  campaign --> campaign_db : owner read/write
+}
+
+package "Statistics bounded context" {
+  component "Statistics Service" as stats
+  database "Statistics PostgreSQL\nprimary + standby\nSoT normalized raw events" as stats_db
+  stats --> stats_db : owner batch write/read
+}
+
+package "Analytics bounded context" {
+  component "Analytics Service" as analytics
+  database "ClickHouse\nreplicated read model\nfacts/aggregates" as ch
+  analytics --> ch : owner ingest/query
+}
+
+package "Finance bounded context" {
+  component "Finance Service" as finance
+  database "Finance PostgreSQL\nprimary + synchronous standby\nSoT ledger/balances/reservations" as finance_db
+  finance --> finance_db : owner ACID read/write
+}
+
+queue "Kafka\nintegration events\nНЕ SoT денег" as kafka
+
+campaign --> kafka : campaign.configuration\ntransactional outbox
+kafka --> bidding : versioned projection
+bidding --> kafka : auction.bid-result\ntransactional outbox
+kafka --> stats : clicks/impressions/bids
+kafka --> analytics : facts + dimensions
+kafka --> finance : charge requests
+finance --> kafka : ledger-entry/allowance\ntransactional outbox
+kafka --> bidding : allowance projection
+
+note bottom of kafka
+  Межсервисного SQL нет.
+  API/events — единственные контракты.
+  Redis, Kafka и ClickHouse не определяют денежный баланс.
+end note
+
+@enduml
