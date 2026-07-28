@@ -1,0 +1,65 @@
+@startuml
+!include <C4/C4_Container>
+
+LAYOUT_WITH_LEGEND()
+LAYOUT_LEFT_RIGHT()
+title C4 Container Diagram — AdScale (TO-BE, 1 год)
+
+Person(advertiser, "Рекламодатель", "Управляет кампаниями и финансами")
+Person(endUser, "Пользователь", "Просматривает рекламу, отправляет impression/click")
+System_Ext(dsp, "DSP-площадка", "OpenRTB bid requests / responses")
+System_Ext(payment, "Платёжный шлюз", "Обработка платежей")
+
+System_Boundary(adscale, "AdScale") {
+  Container(gateway, "API Gateway", "Envoy Gateway / Kong", "TLS, auth, quotas, deadlines, routing и traffic shifting")
+  Container(bidding, "Bidding Service", "Go", "Один deployable-сервис: OpenRTB adapter, candidate index, budget guard, ranking и response")
+  Container(eventCollector, "Event Collector", "Go", "Принимает подписанные callbacks показов/кликов и надёжно публикует события")
+  Container(delivery, "Delivery Service", "Go", "Публикует и выдаёт creatives")
+  Container(campaign, "Campaign Service", "Go", "CRUD кампаний, creatives, targeting и bid settings")
+  Container(finance, "Finance Service", "Go", "Reservations, balances, double-entry ledger, charges и invoices")
+  Container(stats, "Statistics Service", "Python", "Идемпотентный batch ingestion событий")
+  Container(analytics, "Analytics Service", "Python", "Агрегация и отчётность")
+  Container(legacy, "Legacy Monolith", "C++ / Go / Python / Node.js", "Оставшиеся функции до завершения Strangler migration")
+
+  ContainerQueue(kafka, "Managed Kafka", "Kafka", "Версионированные integration events; не источник истины денег")
+  Container(redis, "Managed Redis", "Redis", "Shared L2: versioned snapshot propagation, warm и recovery")
+  ContainerDb(biddingDb, "Bidding Read Model DB", "HA PostgreSQL", "Производная конфигурация и runtime state; не SoT кампаний/денег")
+  ContainerDb(campaignDb, "Campaign DB", "HA PostgreSQL", "SoT конфигурации кампаний")
+  ContainerDb(financeDb, "Finance DB", "HA PostgreSQL", "SoT balances, reservations и ledger")
+  ContainerDb(statsDb, "Statistics DB", "HA PostgreSQL", "Нормализованные сырые события и dedup state")
+  ContainerDb(analyticsDb, "Analytics DB", "ClickHouse cluster", "Производные факты и агрегаты")
+}
+
+Rel(dsp, gateway, "Bid request / response", "HTTPS / OpenRTB")
+Rel(advertiser, gateway, "Management API", "HTTPS / JSON")
+Rel(endUser, gateway, "Impression / click callback", "HTTPS")
+Rel(gateway, bidding, "Bid request с deadline", "HTTP/JSON или gRPC после тестов")
+Rel(gateway, eventCollector, "Verified callback routes", "HTTPS / internal")
+Rel(gateway, campaign, "Campaign commands", "HTTPS / JSON")
+Rel(gateway, finance, "Finance commands/queries", "HTTPS / JSON")
+Rel(gateway, legacy, "Неизвлечённые функции", "HTTPS")
+Rel(campaign, campaignDb, "Owner read/write + outbox", "SQL / ACID")
+Rel(finance, financeDb, "Owner read/write + outbox", "SQL / ACID")
+Rel(campaign, kafka, "Campaign configuration", "Outbox relay / acks=all")
+Rel(finance, kafka, "Allowance и ledger events", "Outbox relay / acks=all")
+Rel(kafka, bidding, "Versioned campaign/allowance projection", "At-least-once + dedup")
+Rel(bidding, biddingDb, "Read/write local projection outside hot path", "SQL")
+Rel(bidding, redis, "Background warm / recovery L2", "RESP")
+Rel(bidding, delivery, "Использует заранее опубликованный creative reference", "Локальный snapshot")
+Rel(bidding, kafka, "Decision telemetry вне response dependency", "Async spool/outbox")
+Rel(eventCollector, kafka, "Фактические impression/click", "acks=all")
+Rel(kafka, stats, "Events", "At-least-once + dedup")
+Rel(kafka, analytics, "Facts/dimensions", "At-least-once + dedup")
+Rel(kafka, finance, "Charge requests from impression/click", "At-least-once + dedup")
+Rel(stats, statsDb, "Batch write", "SQL / ACID")
+Rel(analytics, analyticsDb, "Ingest/query", "Native protocol")
+Rel(finance, payment, "Платёжные операции с idempotency key", "HTTPS / REST")
+
+note right of bidding
+  Обычный bid читает только immutable L1.
+  Не вызывает синхронно Campaign, Finance,
+  Kafka, Redis или PostgreSQL.
+  Неизвестный/stale budget => no-bid.
+end note
+
+@enduml

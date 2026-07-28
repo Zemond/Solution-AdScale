@@ -1,0 +1,74 @@
+@startuml
+title AdScale Task2 — компоненты RTB и DSP-интеграции
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam linetype ortho
+left to right direction
+
+actor "DSP" as dsp
+actor "Пользователь\nбраузера/приложения" as user
+
+rectangle "RTB data plane" {
+  component "API Gateway\nEnvoy Gateway " as gateway
+  component "Bidding Service\nOpenRTB adapter" as bidding
+  component "In-memory\nimmutable snapshot" as memory
+  component "Event Collector\nclick / impression" as collector
+}
+
+rectangle "Management / control plane" {
+  component "Campaign Service\n(на переходе: монолит)" as campaign
+  component "Finance Service\nledger / balances" as finance
+  component "Snapshot Projector" as projector
+  component "Delivery / Creative\nartifacts" as delivery
+}
+
+queue "Apache Kafka" as kafka
+database "Redis / object storage\nsnapshot recovery" as snapshot_store
+database "Campaign DB\nsource of truth" as campaign_db
+database "Finance DB\nidempotent ledger" as finance_db
+component "Statistics Consumer" as stats
+component "Analytics Consumer" as analytics
+
+dsp --> gateway : HTTPS/JSON\nOpenRTB 2.x
+gateway --> bidding : HTTP/JSON или gRPC\nabsolute deadline
+bidding --> memory : локальное чтение\nбез network I/O
+bidding --> gateway : BidResponse / no-bid
+
+user --> gateway : signed click /\nimpression callback
+gateway --> collector : отдельный route/pool
+collector --> kafka : async, at-least-once\nstable event_id
+
+campaign --> campaign_db : CRUD
+campaign --> kafka : outbox/CDC\nversioned changes
+finance --> finance_db : ACID ledger
+finance --> kafka : budget allocations
+kafka --> projector : consume config
+projector --> snapshot_store : versioned snapshot\nchecksum
+snapshot_store --> bidding : background load
+bidding --> memory : validate + atomic swap
+delivery --> campaign : approved creative\nartifact reference
+
+kafka --> stats : click/impression
+kafka --> analytics : click/impression/decision
+kafka --> finance : billable impression/click
+
+note bottom of bidding
+  Hot path не вызывает:
+  PostgreSQL, Redis, Campaign,
+  Finance или Kafka.
+end note
+
+note bottom of gateway
+  TLS, auth, rate/concurrency limit,
+  routing, timeout, outlier detection.
+  Не выполняет bidding rules.
+end note
+
+legend bottom
+  Синхронный RTB: DSP → Gateway → Bidding → DSP
+  Асинхронно: конфигурация и click/impression events
+  Отказ/истёкший deadline: управляемый no-bid
+endlegend
+
+@enduml

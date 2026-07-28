@@ -1,0 +1,75 @@
+@startuml
+title AdScale — Kafka producers, topics и consumer groups
+left to right direction
+skinparam componentStyle rectangle
+skinparam linetype ortho
+
+package Producers {
+  component "Campaign\noutbox relay" as cp
+  component "Bidding\noutbox relay" as bp
+  component "Delivery /\nevent gateway" as dp
+  component "Finance rating\nadapter" as fr
+  component "Finance\noutbox relay" as fp
+}
+
+package "Kafka RF=3, min ISR=2, Avro + Schema Registry" {
+  queue "campaign.configuration.v1\nkey=campaign_id\ncompact + 7d" as tc
+  queue "auction.bid-result.v1\nkey=auction_id\n7d" as tb
+  queue "ad.impression.v1\nkey=campaign_id\n14d" as ti
+  queue "ad.click.v1\nkey=campaign_id\n30d" as tcl
+  queue "finance.charge-request.v1\nkey=account_id\n14d" as tcr
+  queue "finance.ledger-entry.v1\nkey=account_id\n90d" as tle
+  queue "finance.allowance.v1\nkey=account_id\ncompact + 7d" as ta
+  queue "retry topics\n1m / 10m" as retry
+  queue "DLQ\n30d" as dlq
+}
+
+package "Independent consumer groups" {
+  component "bidding-campaign-\nprojection-v1" as bc
+  component "statistics-\ningest-v1" as si
+  component "analytics-\nevents-v1" as ae
+  component "finance-\nrating-v1" as fir
+  component "finance-\ncommand-v1" as fic
+  component "bidding-allowance-\nprojection-v1" as ba
+  component "audit-export-v1" as audit
+}
+
+cp --> tc
+bp --> tb
+dp --> ti
+dp --> tcl
+fr --> tcr
+fp --> tle
+fp --> ta
+
+tc --> bc
+tc --> ae
+tb --> si
+tb --> ae
+ti --> si
+ti --> ae
+ti --> fir
+tcl --> si
+tcl --> ae
+tcl --> fir
+fir --> tcr
+tcr --> fic
+tle --> ae
+tle --> audit
+ta --> ba
+
+si ..> retry : transient error
+fic ..> retry : transient error
+retry ..> dlq : retries exhausted /\npermanent error
+
+cloud "Immutable object storage\nAvro/Parquet + checksums" as archive
+audit --> archive
+si ..> archive : raw-event export
+
+note bottom
+Offset commit — только после durable side effect.
+Outbox может отправить дубль; inbox/unique business ID делает consumer идемпотентным.
+Порядок гарантирован в пределах partition key, не между topics/partitions.
+end note
+
+@enduml

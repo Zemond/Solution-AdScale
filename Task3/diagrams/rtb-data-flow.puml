@@ -1,0 +1,79 @@
+@startuml
+title AdScale — RTB hot path и фиксация событий
+autonumber
+
+actor DSP
+participant "API Gateway" as gateway
+participant "Bidding Service" as bidding
+collections "Immutable L1\nsnapshot" as l1
+database "Redis L2\nwarm/recovery" as redis
+database "Bidding read-model\nPostgreSQL" as readmodel
+database "Bidding PostgreSQL\nauction decision + outbox" as biddingdb
+participant "Outbox relay" as relay
+queue "Kafka" as kafka
+participant "Statistics" as stats
+participant "Analytics" as analytics
+participant "Finance" as finance
+database "Finance PostgreSQL\nmoney SoT" as financedb
+actor "Browser / App" as user
+participant "Event Collector" as collector
+
+DSP -> gateway : OpenRTB bid request
+gateway -> bidding : validated request\n(deadline propagated)
+bidding -> l1 : read immutable snapshot\n+ allowance
+
+alt L1 valid version / age
+  l1 --> bidding : campaigns, targeting,\nallowance, creatives
+  alt eligible and valid Finance-issued allowance
+    bidding -> bidding : choose winner\nwithin latency budget
+    bidding --> gateway : bid response
+    gateway --> DSP : OpenRTB response\n(P95 <= 80 ms; cutoff 60 ms)
+  else no safe data / no allowance
+    bidding --> gateway : no-bid
+    gateway --> DSP : no-bid
+  end
+else stale / missing L1
+  bidding --> gateway : no-bid
+  gateway --> DSP : no-bid
+end
+
+par outside response dependency
+  bidding -> biddingdb : append decision + outbox\nlocal ACID transaction
+  biddingdb -> relay : unpublished outbox
+  relay -> kafka : auction.bid-result.v1\nacks=all
+  kafka -> stats : at-least-once
+  kafka -> analytics : at-least-once
+end
+
+== Background warm / recovery (не sync dependency bid response) ==
+
+redis -> l1 : projector / loader\nversioned snapshot
+readmodel -> redis : rebuild / warm shared L2
+readmodel -> l1 : cold start / recovery
+
+== Billing по факту impression/click ==
+
+user -> gateway : signed impression/click
+gateway -> collector : verified route + token
+collector -> kafka : ad.impression.v1 /\nad.click.v1
+kafka -> stats : at-least-once
+kafka -> analytics : at-least-once
+kafka -> finance : billable event / charge request
+finance -> financedb : idempotent ACID ledger transaction
+financedb --> finance : committed balance + outbox
+finance -> kafka : finance.ledger-entry.v1
+
+note over l1,redis
+Hot path читает только immutable L1.
+Redis L2 и PostgreSQL — background warming,
+propagation и recovery.
+end note
+
+note over finance,financedb
+Billing стартует по impression/click,
+не по auction.bid-result.
+Redis allowance ограничивает уже зарезервированную квоту;
+окончательный баланс — только в Finance PostgreSQL.
+end note
+
+@enduml
